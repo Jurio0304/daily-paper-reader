@@ -60,7 +60,8 @@ class ConferenceSidebarTest(unittest.TestCase):
             self.assertIn("* Conference Papers", text)
             self.assertIn("  * ICML 2025 <!--dpr-conference:icml-2025-->", text)
             self.assertNotIn("推荐论文", text)
-            self.assertIn("    * <a class=\"dpr-sidebar-item-link dpr-sidebar-item-structured\"", text)
+            self.assertIn("    * rl <!--dpr-conference-topic:icml-2025:query-rl-->", text)
+            self.assertIn("      * <a class=\"dpr-sidebar-item-link dpr-sidebar-item-structured\"", text)
             self.assertIn("href=\"#/conference/icml-2025/openreview-icml-2025-abc123-a-conference-paper\"", text)
             self.assertIn("A Conference Paper", text)
             self.assertIn("https://openreview.net/forum?id=abc123", text)
@@ -133,7 +134,7 @@ class ConferenceSidebarTest(unittest.TestCase):
             self.assertFalse((tmp_path / "docs" / "conference" / "icml-2025" / "openreview-icml-2025-low-score-three-paper.md").exists())
             self.assertTrue((tmp_path / "docs" / "conference" / "icml-2025" / "openreview-icml-2025-keep-score-four-paper.md").exists())
 
-    def test_update_sidebar_replaces_existing_conference_block(self):
+    def test_update_sidebar_replaces_existing_topic_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = pathlib.Path(tmp)
             sidebar = tmp_path / "_sidebar.md"
@@ -147,8 +148,36 @@ class ConferenceSidebarTest(unittest.TestCase):
             text = sidebar.read_text(encoding="utf-8")
 
             self.assertEqual(text.count("<!--dpr-conference:icml-2025-->"), 1)
+            self.assertEqual(text.count("<!--dpr-conference-topic:icml-2025:query-rl-->"), 1)
             self.assertNotIn("First Title", text)
             self.assertIn("Second Title", text)
+
+    def test_update_sidebar_merges_different_topics_under_same_conference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            sidebar = tmp_path / "_sidebar.md"
+            result = tmp_path / "conference-icml-2025.supabase.llm.json"
+            sidebar.write_text("* Daily Papers\n", encoding="utf-8")
+
+            self.write_result(result, title="RL Topic Paper")
+            self.mod.update_sidebar_with_conference(sidebar, result, docs_dir=tmp_path / "docs", deep_min_score=-1)
+
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["papers"][0]["id"] = "openreview-icml-2025-xyz789"
+            payload["papers"][0]["title"] = "LLM Topic Paper"
+            payload["papers"][0]["link"] = "https://openreview.net/forum?id=xyz789"
+            payload["papers"][0]["pdf_url"] = "https://openreview.net/pdf?id=xyz789"
+            payload["llm_ranked"][0]["paper_id"] = "openreview-icml-2025-xyz789"
+            payload["llm_ranked"][0]["matched_query_tag"] = "query:llm-sr"
+            result.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            self.mod.update_sidebar_with_conference(sidebar, result, docs_dir=tmp_path / "docs", deep_min_score=-1)
+
+            text = sidebar.read_text(encoding="utf-8")
+            self.assertEqual(text.count("<!--dpr-conference:icml-2025-->"), 1)
+            self.assertIn("<!--dpr-conference-topic:icml-2025:query-rl-->", text)
+            self.assertIn("<!--dpr-conference-topic:icml-2025:query-llm-sr-->", text)
+            self.assertIn("RL Topic Paper", text)
+            self.assertIn("LLM Topic Paper", text)
 
     def test_conference_markdown_writes_media_json_front_matter(self):
         paper = {

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import importlib.util
 import json
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -51,6 +51,36 @@ def build_conference_label(conference: str, years: str) -> str:
 def build_conference_key(conference: str, years: str) -> str:
     key = f"{norm_text(conference).lower()}-{norm_text(years).replace(',', '-')}"
     return re.sub(r"[^a-z0-9-]+", "-", key).strip("-") or "conference"
+
+
+def build_topic_key(kind: str, label: str) -> str:
+    raw = f"{norm_text(kind).lower() or 'query'}-{norm_text(label).lower() or 'general'}"
+    key = re.sub(r"[^a-z0-9-]+", "-", raw).strip("-")
+    if key:
+        return key
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"topic-{digest}"
+
+
+def build_conference_topic_marker(conference: str, years: str, kind: str, label: str) -> str:
+    return f"<!--dpr-conference-topic:{build_conference_key(conference, years)}:{build_topic_key(kind, label)}-->"
+
+
+def topic_from_ranked_item(item: Dict[str, Any]) -> Tuple[str, str]:
+    matched_tag = norm_text(item.get("matched_query_tag"))
+    if matched_tag:
+        kind, label = normalize_sidebar_tag(matched_tag)
+        if label:
+            return kind or "query", label
+    return "query", "General"
+
+
+def topic_from_profile_tag(profile_tag: str) -> Tuple[str, str]:
+    text = norm_text(profile_tag)
+    if not text:
+        return "query", "General"
+    kind, label = normalize_sidebar_tag(text)
+    return kind or "query", label or text
 
 
 def slugify(value: str) -> str:
@@ -559,21 +589,22 @@ def cleanup_conference_outputs(
     conference: str,
     years: str,
 ) -> None:
-    conference_dir = docs_dir / "conference" / build_conference_key(conference, years)
-    if conference_dir.exists() and conference_dir.is_dir():
-        shutil.rmtree(conference_dir)
+    # 会议检索会被不同 profile/tag 反复触发。这里不能删除整个 conference/year
+    # 目录，否则新词条会覆盖旧词条已经生成的正文页和图表资源。
+    return None
 
-    kept_ids = {norm_text(item.get("paper_id")) for item in kept_ranked if norm_text(item.get("paper_id"))}
-    for paper_id, paper in papers.items():
-        if paper_id in kept_ids:
-            continue
-        source_key = source_key_for_figures(paper)
-        asset_key = norm_text(paper.get("id")) or slugify(norm_text(paper.get("title")))
-        if not asset_key:
-            continue
-        figure_dir = docs_dir / "assets" / "figures" / source_key / asset_key
-        if figure_dir.exists() and figure_dir.is_dir():
-            shutil.rmtree(figure_dir)
+
+def group_ranked_by_topic(ranked: List[Dict[str, Any]]) -> List[Tuple[str, str, List[Dict[str, Any]]]]:
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    order: List[Tuple[str, str]] = []
+    for item in ranked:
+        kind, label = topic_from_ranked_item(item)
+        key = (kind, label)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(item)
+    return [(kind, label, grouped[(kind, label)]) for kind, label in order]
 
 
 def build_conference_block(
@@ -593,7 +624,6 @@ def build_conference_block(
         if isinstance(item, dict) and norm_text(item.get("id"))
     }
     ranked = collect_ranked_ids(data, limit, min_score=display_min_score)
-    cleanup_conference_outputs(docs_dir, papers, ranked, conference, years)
     route_by_id = write_conference_docs(
         docs_dir,
         papers,
@@ -604,20 +634,23 @@ def build_conference_block(
     )
 
     lines = [f"  * {label} {marker}\n"]
-    for item in ranked:
-        paper_id = norm_text(item.get("paper_id"))
-        paper = papers.get(paper_id)
-        if not paper:
-            continue
-        title = norm_text(paper.get("title")) or paper_id
-        route = route_by_id.get(paper_id) or build_conference_paper_route(paper, conference, years)
-        href = f"#/{route}"
-        payload = build_sidebar_payload(paper, item, conference, years)
-        lines.append(
-            "    * "
-            f'<a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="{html.escape(href, quote=True)}" '
-            f'data-sidebar-item="{payload}">{html.escape(title)}</a>\n'
-        )
+    for kind, topic_label, topic_ranked in group_ranked_by_topic(ranked):
+        topic_marker = build_conference_topic_marker(conference, years, kind, topic_label)
+        lines.append(f"    * {topic_label} {topic_marker}\n")
+        for item in topic_ranked:
+            paper_id = norm_text(item.get("paper_id"))
+            paper = papers.get(paper_id)
+            if not paper:
+                continue
+            title = norm_text(paper.get("title")) or paper_id
+            route = route_by_id.get(paper_id) or build_conference_paper_route(paper, conference, years)
+            href = f"#/{route}"
+            payload = build_sidebar_payload(paper, item, conference, years)
+            lines.append(
+                "      * "
+                f'<a class="dpr-sidebar-item-link dpr-sidebar-item-structured" href="{html.escape(href, quote=True)}" '
+                f'data-sidebar-item="{payload}">{html.escape(title)}</a>\n'
+            )
     return lines
 
 
@@ -651,6 +684,78 @@ def remove_existing_conference_block(lines: List[str], marker: str) -> None:
     del lines[block_idx:end]
 
 
+def find_conference_block(lines: List[str], marker: str) -> Tuple[int, int]:
+    heading_idx = find_conference_heading(lines)
+    if heading_idx < 0:
+        return -1, -1
+    block_idx = -1
+    for idx in range(heading_idx + 1, len(lines)):
+        if lines[idx].startswith("* "):
+            break
+        if marker in lines[idx]:
+            block_idx = idx
+            break
+    if block_idx < 0:
+        return -1, -1
+    end = block_idx + 1
+    while end < len(lines):
+        if lines[end].startswith("  * ") and not lines[end].startswith("    * "):
+            break
+        if lines[end].startswith("* "):
+            break
+        end += 1
+    return block_idx, end
+
+
+def remove_existing_topic_blocks(lines: List[str], conference_marker: str, topic_markers: Iterable[str]) -> None:
+    topic_marker_set = {marker for marker in topic_markers if marker}
+    if not topic_marker_set:
+        return
+    block_idx, block_end = find_conference_block(lines, conference_marker)
+    if block_idx < 0:
+        return
+
+    idx = block_idx + 1
+    while idx < block_end:
+        line = lines[idx]
+        if line.startswith("    * ") and any(marker in line for marker in topic_marker_set):
+            end = idx + 1
+            while end < block_end:
+                if lines[end].startswith("    * ") and not lines[end].startswith("      * "):
+                    break
+                if lines[end].startswith("  * ") and not lines[end].startswith("    * "):
+                    break
+                if lines[end].startswith("* "):
+                    break
+                end += 1
+            del lines[idx:end]
+            block_end -= end - idx
+            continue
+        idx += 1
+
+
+def remove_legacy_direct_conference_items(lines: List[str], conference_marker: str) -> None:
+    block_idx, block_end = find_conference_block(lines, conference_marker)
+    if block_idx < 0:
+        return
+    idx = block_idx + 1
+    while idx < block_end:
+        if lines[idx].startswith("    * ") and "dpr-conference-topic:" not in lines[idx]:
+            del lines[idx]
+            block_end -= 1
+            continue
+        idx += 1
+
+
+def ensure_conference_block(lines: List[str], marker: str, label: str) -> int:
+    block_idx, _block_end = find_conference_block(lines, marker)
+    if block_idx >= 0:
+        return block_idx
+    heading_idx = ensure_conference_heading(lines)
+    lines.insert(heading_idx + 1, f"  * {label} {marker}\n")
+    return heading_idx + 1
+
+
 def ensure_conference_heading(lines: List[str]) -> int:
     heading_idx = find_conference_heading(lines)
     if heading_idx >= 0:
@@ -681,8 +786,6 @@ def update_sidebar_with_conference(
     lines = sidebar_path.read_text(encoding="utf-8").splitlines(keepends=True) if sidebar_path.exists() else []
     conference, years = parse_conference_result_name(result_path)
     marker = build_conference_marker(conference, years)
-    remove_existing_conference_block(lines, marker)
-    heading_idx = ensure_conference_heading(lines)
     block = build_conference_block(
         result_path,
         docs_dir=docs_dir,
@@ -690,7 +793,18 @@ def update_sidebar_with_conference(
         deep_min_score=deep_min_score,
         display_min_score=display_min_score,
     )
-    lines[heading_idx + 1:heading_idx + 1] = block
+    label = build_conference_label(conference, years)
+    topic_markers = [
+        f"<!--{line.split('<!--', 1)[1].rsplit('-->', 1)[0]}-->"
+        for line in block[1:]
+        if "<!--dpr-conference-topic:" in line
+    ]
+
+    ensure_conference_block(lines, marker, label)
+    remove_existing_topic_blocks(lines, marker, topic_markers)
+    remove_legacy_direct_conference_items(lines, marker)
+    _block_idx, block_end = find_conference_block(lines, marker)
+    lines[block_end:block_end] = block[1:]
     sidebar_path.write_text("".join(lines), encoding="utf-8")
 
 
