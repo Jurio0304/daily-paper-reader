@@ -104,6 +104,32 @@ class PublicConferenceSupabaseDeployTest(unittest.TestCase):
             self.mod.main()
         post.assert_not_called()
 
+    def test_build_sync_commands_uses_python_argument_arrays(self):
+        commands = self.mod.build_sync_commands(raw_dir="/tmp/raw", run_date="20260629")
+        self.assertEqual(len(commands), 4)
+        first = commands[0]
+        self.assertEqual(first[1], "src/maintain/sync.py")
+        self.assertIn("--backend-key", first)
+        self.assertIn("osdi", first)
+        self.assertIn("--raw-input", first)
+        self.assertIn("/tmp/raw/osdi.json", first)
+        self.assertNotIn(";", " ".join(first))
+
+    def test_sync_flag_without_yes_stays_dry_run(self):
+        argv = ["public_conference_supabase_deploy.py", "--sync"]
+        with patch.object(sys, "argv", argv), patch.object(self.mod.subprocess, "run") as run, patch("sys.stdout", new_callable=io.StringIO):
+            self.mod.main()
+        run.assert_not_called()
+
+    def test_run_sync_commands_sets_pythonpath_and_runs_all_conferences(self):
+        with patch.object(self.mod.subprocess, "run") as run:
+            self.mod.run_sync_commands(raw_dir="/tmp/raw", run_date="20260629")
+        self.assertEqual(run.call_count, 4)
+        args, kwargs = run.call_args
+        self.assertEqual(kwargs["cwd"], self.mod.ROOT_DIR)
+        self.assertIn(str(self.mod.SRC_DIR), kwargs["env"]["PYTHONPATH"])
+        self.assertEqual(args[0][1], "src/maintain/sync.py")
+
 
 if __name__ == "__main__":
     unittest.main()

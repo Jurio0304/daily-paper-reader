@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -264,22 +266,55 @@ def verify_public_conferences(
         )
 
 
-def print_sync_commands(raw_dir: str = "/tmp/dpr_public_conference", run_date: str = "20260629") -> None:
+def build_sync_commands(raw_dir: str = "/tmp/dpr_public_conference", run_date: str = "20260629") -> List[List[str]]:
+    commands: List[List[str]] = []
     for key, table in CONFERENCE_TABLES.items():
         raw_path = Path(raw_dir) / f"{key}.json"
-        print(
-            "PYTHONPATH=src python src/maintain/sync.py "
-            f"--backend-key {key} "
-            f"--date {run_date} "
-            f"--schema public "
-            f"--raw-input {raw_path} "
-            f"--papers-table {table} "
-            "--embed-device cpu "
-            "--embed-batch-size 8 "
-            "--embed-chunk-size 512 "
-            "--stream-upsert "
-            "--upload-workers 2"
+        commands.append(
+            [
+                sys.executable,
+                "src/maintain/sync.py",
+                "--backend-key",
+                key,
+                "--date",
+                run_date,
+                "--schema",
+                "public",
+                "--raw-input",
+                str(raw_path),
+                "--papers-table",
+                table,
+                "--embed-device",
+                "cpu",
+                "--embed-batch-size",
+                "8",
+                "--embed-chunk-size",
+                "512",
+                "--stream-upsert",
+                "--upload-workers",
+                "2",
+            ]
         )
+    return commands
+
+
+def format_command(command: List[str]) -> str:
+    return "PYTHONPATH=src " + " ".join(shlex.quote(part) for part in command)
+
+
+def print_sync_commands(raw_dir: str = "/tmp/dpr_public_conference", run_date: str = "20260629") -> None:
+    for command in build_sync_commands(raw_dir=raw_dir, run_date=run_date):
+        print(format_command(command))
+
+
+def run_sync_commands(raw_dir: str = "/tmp/dpr_public_conference", run_date: str = "20260629") -> None:
+    env = os.environ.copy()
+    src_path = str(SRC_DIR)
+    existing = _norm(env.get("PYTHONPATH"))
+    env["PYTHONPATH"] = src_path if not existing else src_path + os.pathsep + existing
+    for key, command in zip(CONFERENCE_TABLES, build_sync_commands(raw_dir=raw_dir, run_date=run_date)):
+        print(f"[sync] {key}: {format_command(command)}", flush=True)
+        subprocess.run(command, cwd=ROOT_DIR, env=env, check=True)
 
 
 def main() -> None:
@@ -291,8 +326,11 @@ def main() -> None:
     parser.add_argument("--anon-key", default=os.getenv("SUPABASE_ANON_KEY", ""))
     parser.add_argument("--schema", default=os.getenv("SUPABASE_SCHEMA", "public"))
     parser.add_argument("--raw-dir", default="/tmp/dpr_public_conference")
+    parser.add_argument("--run-date", default="20260629")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--print-sync-commands", action="store_true")
+    parser.add_argument("--sync", action="store_true", help="执行四个会议的 sync.py 入库。会写入生产 Supabase。")
+    parser.add_argument("--skip-sql", action="store_true", help="配合 --yes 使用：跳过 SQL apply，只执行 sync/verify。")
     parser.add_argument("--verify", action="store_true", help="执行只读 REST/RPC 验证。会调用生产 Supabase API。")
     args = parser.parse_args()
 
@@ -311,9 +349,11 @@ def main() -> None:
 
     if args.print_sync_commands:
         print("[plan] sync commands:")
-        print_sync_commands(raw_dir=args.raw_dir)
+        print_sync_commands(raw_dir=args.raw_dir, run_date=args.run_date)
 
     if not args.yes:
+        if args.sync:
+            print("[dry-run] --sync 需要显式配合 --yes，当前不调用 Supabase API。")
         if args.verify:
             print("[dry-run] --verify 需要显式配合 --yes，当前不调用 Supabase API。")
         print("[dry-run] 未传入 --yes，不调用 Supabase API。")
@@ -321,8 +361,12 @@ def main() -> None:
     if not project_ref or not access_token:
         raise SystemExit("缺少 SUPABASE_PROJECT_REF/SUPABASE_URL 或 SUPABASE_ACCESS_TOKEN")
 
-    apply_sql_files(project_ref=project_ref, access_token=access_token, paths=paths, timeout=args.timeout)
-    print("[done] SQL applied")
+    if not args.skip_sql:
+        apply_sql_files(project_ref=project_ref, access_token=access_token, paths=paths, timeout=args.timeout)
+        print("[done] SQL applied")
+    if args.sync:
+        run_sync_commands(raw_dir=args.raw_dir, run_date=args.run_date)
+        print("[done] sync finished")
     if args.verify:
         if not supabase_url or not anon_key:
             raise SystemExit("缺少 SUPABASE_URL 或 SUPABASE_ANON_KEY，无法验证")
